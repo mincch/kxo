@@ -1,7 +1,10 @@
+#include <linux/kfifo.h>
 #include <linux/slab.h>
 
 #include "game.h"
 
+
+extern struct kfifo rx_fifo;
 
 const line_t lines[4] = {
     {0, 1, 0, 0, BOARD_SIZE, BOARD_SIZE - GOAL + 1},             // ROW
@@ -66,4 +69,15 @@ int *available_moves(const char *table)
     if (m < N_GRIDS)
         moves[m] = -1;
     return moves;
+}
+
+void kxo_pack_and_push(const char table[16])
+{
+    uint32_t bits = 0;
+
+    for (int i = 0; i < 16; ++i) {
+        uint32_t v = (table[i] == 'X') ? 1 : (table[i] == 'O') ? 2 : 0;
+        bits |= v << (i * 2);
+    }
+    kfifo_in(&rx_fifo, &bits, sizeof(bits));
 }

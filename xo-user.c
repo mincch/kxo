@@ -1,14 +1,13 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/select.h>
 #include <termios.h>
 #include <unistd.h>
-
-#include "game.h"
 
 #define XO_STATUS_FILE "/sys/module/kxo/initstate"
 #define XO_DEVICE_FILE "/dev/kxo"
@@ -46,9 +45,25 @@ static void raw_mode_enable(void)
     tcgetattr(STDIN_FILENO, &orig_termios);
     atexit(raw_mode_disable);
     struct termios raw = orig_termios;
-    raw.c_iflag &= ~IXON;
-    raw.c_lflag &= ~(ECHO | ICANON);
+    raw.c_iflag &= ~(IXON | ICRNL);
+    raw.c_lflag &= ~(ECHO | ICANON | ISIG | IEXTEN);
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+}
+
+static void draw_board(uint32_t bits)
+{
+    printf("\x1b[H");
+    for (int r = 0; r < 4; ++r) {
+        printf("|");
+        for (int c = 0; c < 4; ++c) {
+            int idx = r * 4 + c;
+            uint32_t v = (bits >> (idx * 2)) & 3;
+            char ch = (v == 1) ? 'X' : (v == 2) ? 'O' : ' ';
+            printf(" %c |", ch);
+        }
+        printf("\n-----------------\n");
+    }
+    fflush(stdout);
 }
 
 static bool read_attr, end_attr;
@@ -61,21 +76,20 @@ static void listen_keyboard_handler(void)
     if (read(STDIN_FILENO, &input, 1) == 1) {
         char buf[20];
         switch (input) {
-        case 16: /* Ctrl-P */
+        case 16:
             read(attr_fd, buf, 6);
             buf[0] = (buf[0] - '0') ? '0' : '1';
             read_attr ^= 1;
             write(attr_fd, buf, 6);
-            if (!read_attr)
-                printf("\n\nStopping to display the chess board...\n");
+
             break;
-        case 17: /* Ctrl-Q */
+        case 17:
             read(attr_fd, buf, 6);
             buf[4] = '1';
             read_attr = false;
             end_attr = true;
             write(attr_fd, buf, 6);
-            printf("\n\nStopping the kernel space tic-tac-toe game...\n");
+
             break;
         }
     }
@@ -91,34 +105,29 @@ int main(int argc, char *argv[])
     int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
     fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
 
-    char display_buf[DRAWBUFFER_SIZE];
 
     fd_set readset;
-    int device_fd = open(XO_DEVICE_FILE, O_RDONLY);
+    int device_fd = open(XO_DEVICE_FILE, O_RDONLY | O_NONBLOCK);
     int max_fd = device_fd > STDIN_FILENO ? device_fd : STDIN_FILENO;
     read_attr = true;
     end_attr = false;
+
+    printf("\x1b[2J");
 
     while (!end_attr) {
         FD_ZERO(&readset);
         FD_SET(STDIN_FILENO, &readset);
         FD_SET(device_fd, &readset);
-
-        int result = select(max_fd + 1, &readset, NULL, NULL, NULL);
-        if (result < 0) {
+        if (select(max_fd + 1, &readset, NULL, NULL, NULL) < 0) {
             printf("Error with select system call\n");
             exit(1);
         }
-
-        if (FD_ISSET(STDIN_FILENO, &readset)) {
-            FD_CLR(STDIN_FILENO, &readset);
+        if (FD_ISSET(STDIN_FILENO, &readset))
             listen_keyboard_handler();
-        } else if (read_attr && FD_ISSET(device_fd, &readset)) {
-            FD_CLR(device_fd, &readset);
-            printf("\033[H\033[J"); /* ASCII escape code to clear the screen */
-            read(device_fd, display_buf, DRAWBUFFER_SIZE);
-            display_buf[DRAWBUFFER_SIZE - 1] = '\0';
-            printf("%s", display_buf);
+        else if (read_attr && FD_ISSET(device_fd, &readset)) {
+            uint32_t bits;
+            if (read(device_fd, &bits, sizeof(bits)) == 4)
+                draw_board(bits);
         }
     }
 
@@ -126,6 +135,5 @@ int main(int argc, char *argv[])
     fcntl(STDIN_FILENO, F_SETFL, flags);
 
     close(device_fd);
-
     return 0;
 }
