@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sys/select.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #define XO_STATUS_FILE "/sys/module/kxo/initstate"
@@ -52,18 +53,15 @@ static void raw_mode_enable(void)
 
 static void draw_board(uint32_t bits)
 {
-    printf("\x1b[H");
     for (int r = 0; r < 4; ++r) {
         printf("|");
         for (int c = 0; c < 4; ++c) {
-            int idx = r * 4 + c;
-            uint32_t v = (bits >> (idx * 2)) & 3;
-            char ch = (v == 1) ? 'X' : (v == 2) ? 'O' : ' ';
+            uint32_t v = (bits >> ((r * 4 + c) * 2)) & 3;
+            char ch = v == 1 ? 'X' : v == 2 ? 'O' : ' ';
             printf(" %c |", ch);
         }
-        printf("\n-----------------\n");
+        printf("\r\n-----------------\r\n");
     }
-    fflush(stdout);
 }
 
 static bool read_attr, end_attr;
@@ -96,11 +94,30 @@ static void listen_keyboard_handler(void)
     close(attr_fd);
 }
 
+static void draw_time(void)
+{
+    time_t now = time(NULL);
+    const struct tm *tm = localtime(&now);
+    printf("\x1b[H");
+    printf("Time: %02d:%02d:%02d\x1b[K", tm->tm_hour, tm->tm_min, tm->tm_sec);
+    fflush(stdout);
+}
+
+static void redraw_board(uint32_t bits)
+{
+    printf("\x1b[2J\x1b[H");
+    draw_time();
+    putchar('\n');
+    draw_board(bits);
+    fflush(stdout);
+}
+
+
 int main(int argc, char *argv[])
 {
     if (!status_check())
         exit(1);
-
+    setvbuf(stdout, NULL, _IONBF, 0);
     raw_mode_enable();
     int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
     fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
@@ -113,27 +130,55 @@ int main(int argc, char *argv[])
     end_attr = false;
 
     printf("\x1b[2J");
+    printf("\x1b[?25l");
+
+    uint32_t last_bits = 0;
+    bool need_full_redraw = true;
 
     while (!end_attr) {
         FD_ZERO(&readset);
         FD_SET(STDIN_FILENO, &readset);
         FD_SET(device_fd, &readset);
-        if (select(max_fd + 1, &readset, NULL, NULL, NULL) < 0) {
-            printf("Error with select system call\n");
-            exit(1);
+
+        struct timeval tv = {1, 0};
+        int ret = select(max_fd + 1, &readset, NULL, NULL, &tv);
+        if (ret < 0) {
+            perror("select");
+            break;
         }
-        if (FD_ISSET(STDIN_FILENO, &readset))
+
+        if (ret == 0) {
+            draw_time();
+            continue;
+        }
+
+        if (FD_ISSET(STDIN_FILENO, &readset)) {
             listen_keyboard_handler();
-        else if (read_attr && FD_ISSET(device_fd, &readset)) {
+            if (read_attr)
+                need_full_redraw = true;
+        } else if (FD_ISSET(device_fd, &readset)) {
             uint32_t bits;
-            if (read(device_fd, &bits, sizeof(bits)) == 4)
-                draw_board(bits);
+            if (read(device_fd, &bits, 4) == 4) {
+                last_bits = bits;
+                need_full_redraw = true;
+            }
+        }
+
+
+        if (need_full_redraw && read_attr) {
+            redraw_board(last_bits);
+            need_full_redraw = false;
+        } else {
+            draw_time();
         }
     }
+
+
 
     raw_mode_disable();
     fcntl(STDIN_FILENO, F_SETFL, flags);
 
     close(device_fd);
+    printf("\x1b[?25h");
     return 0;
 }
