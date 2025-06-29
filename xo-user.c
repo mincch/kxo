@@ -65,7 +65,12 @@ static void draw_board(uint32_t bits)
 }
 
 static bool read_attr, end_attr;
+static char moves[128][4];
+static int n_moves;
+static char game_lines[64][256];
+static int n_games;
 
+static void game_over_flush(void);
 static void listen_keyboard_handler(void)
 {
     int attr_fd = open(XO_DEVICE_ATTR_FILE, O_RDWR);
@@ -85,6 +90,7 @@ static void listen_keyboard_handler(void)
             read(attr_fd, buf, 6);
             buf[4] = '1';
             read_attr = false;
+            game_over_flush();
             end_attr = true;
             write(attr_fd, buf, 6);
 
@@ -103,13 +109,55 @@ static void draw_time(void)
     fflush(stdout);
 }
 
-static void redraw_board(uint32_t bits)
+static void redraw_board(uint32_t bits, bool clear)
 {
-    printf("\x1b[2J\x1b[H");
+    if (clear)
+        printf("\x1b[2J\x1b[H");
+    else
+        printf("\x1b[H");
     draw_time();
     putchar('\n');
     draw_board(bits);
     fflush(stdout);
+}
+static void record_move(uint32_t oldb, uint32_t newb)
+{
+    if (n_moves >= 128)
+        return;
+    for (int i = 0; i < 16; ++i) {
+        uint32_t o = (oldb >> (i * 2)) & 3;
+        uint32_t n = (newb >> (i * 2)) & 3;
+        if (o == 0 && n != 0) {
+            moves[n_moves][0] = 'A' + (i % 4);
+            moves[n_moves][1] = '1' + (i / 4);
+            moves[n_moves][2] = '\0';
+            ++n_moves;
+            break;
+        }
+    }
+}
+
+static void game_over_flush(void)
+{
+    if (!n_moves)
+        return;
+    int len = 0;
+    len += snprintf(game_lines[n_games] + len, sizeof(game_lines[0]) - len,
+                    "Moves:");
+    for (int i = 0; i < n_moves; ++i)
+        len += snprintf(game_lines[n_games] + len, sizeof(game_lines[0]) - len,
+                        " %s%s", moves[i], (i + 1 == n_moves) ? "" : " -> ");
+    n_games++;
+    n_moves = 0;
+}
+
+static inline int occupied_cells(uint32_t b)
+{
+    int cnt = 0;
+    for (int i = 0; i < 16; ++i)
+        if ((b >> (i * 2)) & 3)
+            ++cnt;
+    return cnt;
 }
 
 
@@ -134,6 +182,9 @@ int main(int argc, char *argv[])
 
     uint32_t last_bits = 0;
     bool need_full_redraw = true;
+    int last_occ = 0;
+    n_games = 0;
+    n_moves = 0;
 
     while (!end_attr) {
         FD_ZERO(&readset);
@@ -159,6 +210,13 @@ int main(int argc, char *argv[])
         } else if (FD_ISSET(device_fd, &readset)) {
             uint32_t bits;
             if (read(device_fd, &bits, 4) == 4) {
+                int occ = occupied_cells(bits);
+                if (occ < last_occ && last_occ)
+                    game_over_flush();
+
+                last_occ = occ;
+                if (bits)
+                    record_move(last_bits, bits);
                 last_bits = bits;
                 need_full_redraw = true;
             }
@@ -166,18 +224,20 @@ int main(int argc, char *argv[])
 
 
         if (need_full_redraw && read_attr) {
-            redraw_board(last_bits);
+            redraw_board(last_bits, true);
             need_full_redraw = false;
         } else {
             draw_time();
         }
     }
-
-
+    redraw_board(last_bits, false);
+    game_over_flush();
+    putchar('\n');
+    for (int g = 0; g < n_games; ++g)
+        printf("%s\n", game_lines[g]);
 
     raw_mode_disable();
     fcntl(STDIN_FILENO, F_SETFL, flags);
-
     close(device_fd);
     printf("\x1b[?25h");
     return 0;
